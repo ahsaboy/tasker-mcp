@@ -33,17 +33,44 @@ Using `adb push`:
 adb push dist/tasker-mcp-server-cli-aarch64 /data/data/com.termux/files/home/mcp-server
 ```
 
-- Run the server in SSE mode with:
+- Run the server in recommended **HTTP mode** with:
 
 ```bash
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode sse
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --mcp-path /mcp --health-path /healthz
 ```
 
-- Or call it through the stdio transport:
+- Header auth is optional and disabled by default. It only turns on when both `--auth-header-name` and `--auth-header-value` are provided, so existing network deployments are unchanged unless you opt in.
+
+- Run HTTP mode with header auth enabled:
+
+```bash
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --mcp-path /mcp --health-path /healthz --auth-header-name X-Tasker-Token --auth-header-value your-secret
+```
+
+- HTTP mode request examples:
+
+```bash
+# Missing header -> 401
+curl -i -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# Correct header -> MCP response
+curl -i -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' -H 'X-Tasker-Token: your-secret' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# Health endpoint stays public
+curl -i http://127.0.0.1:8000/healthz
+```
+
+- `stdio` transport is unaffected by header auth:
 
 ```bash
 payload='{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "tasker_flash_text", "arguments": { "text": "Hi" }  } }'
 echo $payload | ./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_...
+```
+
+- SSE is still available as a compatibility mode during migration, but HTTP mode is the recommended transport:
+
+```bash
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode sse
 ```
 
 #### Command-Line Flags
@@ -51,16 +78,42 @@ echo $payload | ./mcp-server --tools /path/to/toolDescriptions.json --tasker-api
 The `tasker-mcp-server-cli` application accepts the following flags:
 
 - `--tools`: Path to JSON file with Tasker tool definitions.
-- `--host`: Host address to listen on for SSE server (default: `0.0.0.0`).
-- `--port`: Port to listen on for SSE server (default: `8000`).
-- `--mode`: Transport mode: `sse`, or `stdio` (default: `stdio`).
+- `--host`: Host address to listen on for network server (default: `0.0.0.0`).
+- `--port`: Port to listen on for network server (default: `8000`).
+- `--mode`: Transport mode: `http`, `streamable-http`, `sse`, or `stdio` (default: `stdio`).
+- `--mcp-path`: HTTP MCP endpoint path in HTTP mode (default: `/mcp`).
+- `--health-path`: HTTP health endpoint path in HTTP mode (default: `/healthz`).
 - `--tasker-host`: Tasker server host (default: `0.0.0.0`).
 - `--tasker-port`: Tasker server port (default: `1821`).
 - `--tasker-api-key`: The Tasker API Key.
+- `--auth-header-name`: Header name required to access network MCP endpoints. Example: `X-Tasker-Token`.
+- `--auth-header-value`: Expected value for `--auth-header-name`.
+
+**Header auth behavior:**
+- Header auth is disabled by default.
+- Header auth is enabled only when both `--auth-header-name` and `--auth-header-value` are non-empty.
+- If only one auth flag is set, auth stays disabled and the server logs a warning.
+- Protection scope is only network MCP endpoints (`--mcp-path` in HTTP mode, `/sse` and `/message` in SSE compatibility mode).
+- Health endpoint (`--health-path`) remains public.
+- `--mode stdio` is unaffected.
 
 ### Step 3: Connect Your MCP-enabled App
 
 - Connect your MCP-enabled application by pointing it to the running server.
+
+#### HTTP migration note (SSE -> HTTP)
+
+If you currently run SSE (`--mode sse`), migrate to HTTP by switching startup flags:
+
+```bash
+# Before (compatibility mode)
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode sse --host 0.0.0.0 --port 8000
+
+# After (recommended)
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --host 0.0.0.0 --port 8000 --mcp-path /mcp --health-path /healthz
+```
+
+Then connect MCP clients to the HTTP endpoint path (`/mcp` by default).
 
 #### Example Configuration for Claude Desktop with stdio transport
 

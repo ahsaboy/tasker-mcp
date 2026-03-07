@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/dceluis/mcp-go/mcp"
 	"github.com/dceluis/mcp-go/server"
@@ -116,72 +117,188 @@ func NewMCPServer() *server.MCPServer {
 		log.Fatalf("Failed to load tools from file: %v", err)
 	}
 
-	// Map to hold tool handlers for STDIO transport.
-	toolHandlers := make(map[string]server.ToolHandlerFunc)
+	for _, tool := range taskerTools {
+		inputSchema := tool.InputSchema
 
-  for _, tool := range taskerTools {
-    // Since tool.InputSchema is already a map[string]interface{}, assign it directly.
-    inputSchema := tool.InputSchema
+		var opts []mcp.ToolOption
+		if inputSchema != nil {
+			var required []string
+			if req, ok := inputSchema["required"].([]interface{}); ok {
+				for _, r := range req {
+					if str, ok := r.(string); ok {
+						required = append(required, str)
+					}
+				}
+			}
 
-    var opts []mcp.ToolOption
-    // Check if inputSchema is not nil.
-    if inputSchema != nil {
-        // Extract required fields if available.
-        var required []string
-        if req, ok := inputSchema["required"].([]interface{}); ok {
-            for _, r := range req {
-                if str, ok := r.(string); ok {
-                    required = append(required, str)
-                }
-            }
-        }
-        // Process properties.
-        if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
-            for key, propRaw := range props {
-                if prop, ok := propRaw.(map[string]interface{}); ok {
-                    desc := ""
-                    if d, ok := prop["description"].(string); ok {
-                        desc = d
-                    }
-                    var propOpts []mcp.PropertyOption
-                    for _, reqKey := range required {
-                        if reqKey == key {
-                            propOpts = append(propOpts, mcp.Required())
-                            break
-                        }
-                    }
-                    if desc != "" {
-                        propOpts = append(propOpts, mcp.Description(desc))
-                    }
-                    // Based on type, add the proper argument option.
-                    switch t := prop["type"].(string); t {
-                    case "string":
-                        opts = append(opts, mcp.WithString(key, propOpts...))
-                    case "number":
-                        opts = append(opts, mcp.WithNumber(key, propOpts...))
-                    default:
-                        opts = append(opts, mcp.WithString(key, propOpts...))
-                    }
-                }
-            }
-        }
-    }
-    // Use ... to expand the opts slice into variadic arguments.
-    allOpts := append([]mcp.ToolOption{mcp.WithDescription(tool.Description)}, opts...)
-    toolObj := mcp.NewTool(tool.Name, allOpts...)
-    handler := genericToolHandler(tool)
-    mcpServer.AddTool(toolObj, handler)
-    toolHandlers[tool.Name] = handler
-}
+			if props, ok := inputSchema["properties"].(map[string]interface{}); ok {
+				for key, propRaw := range props {
+					if prop, ok := propRaw.(map[string]interface{}); ok {
+						desc := ""
+						if d, ok := prop["description"].(string); ok {
+							desc = d
+						}
+
+						var propOpts []mcp.PropertyOption
+						for _, reqKey := range required {
+							if reqKey == key {
+								propOpts = append(propOpts, mcp.Required())
+								break
+							}
+						}
+						if desc != "" {
+							propOpts = append(propOpts, mcp.Description(desc))
+						}
+
+						switch t := prop["type"].(string); t {
+						case "string":
+							opts = append(opts, mcp.WithString(key, propOpts...))
+						case "number":
+							opts = append(opts, mcp.WithNumber(key, propOpts...))
+						default:
+							opts = append(opts, mcp.WithString(key, propOpts...))
+						}
+					}
+				}
+			}
+		}
+
+		allOpts := append([]mcp.ToolOption{mcp.WithDescription(tool.Description)}, opts...)
+		toolObj := mcp.NewTool(tool.Name, allOpts...)
+		handler := genericToolHandler(tool)
+		mcpServer.AddTool(toolObj, handler)
+	}
 
 	return mcpServer
 }
 
+func normalizePath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
+func isHeaderAuthEnabled(name, value string) bool {
+	return strings.TrimSpace(name) != "" && value != ""
+}
+
+func withHeaderAuth(next http.Handler, name, value string) http.Handler {
+	if !isHeaderAuthEnabled(name, value) {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(name) != value {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func startHTTPServer(mcpServer *server.MCPServer, host, port, mcpPath, healthPath, authHeaderName, authHeaderValue string) error {
+	mcpPath = normalizePath(mcpPath)
+	healthPath = normalizePath(healthPath)
+	if mcpPath == "" {
+		return fmt.Errorf("mcp path cannot be empty")
+	}
+
+	authEnabled := isHeaderAuthEnabled(authHeaderName, authHeaderValue)
+	mux := http.NewServeMux()
+
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", "POST, OPTIONS")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, "Method not allowed")
+			return
+		}
+
+		sessionID := r.Header.Get("Mcp-Session-Id")
+		if sessionID == "" {
+			sessionID = r.URL.Query().Get("sessionId")
+		}
+		if sessionID == "" {
+			sessionID = "http"
+		}
+
+		ctx := mcpServer.WithContext(r.Context(), server.NotificationContext{
+			ClientID:  sessionID,
+			SessionID: sessionID,
+		})
+
+		var rawMessage json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&rawMessage); err != nil {
+			writeJSONRPCError(w, nil, mcp.PARSE_ERROR, "Parse error")
+			return
+		}
+
+		response := mcpServer.HandleMessage(ctx, rawMessage)
+		if response == nil {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			log.Printf("Failed to encode MCP response: %v", err)
+		}
+	})
+
+	mux.Handle(mcpPath, withHeaderAuth(mcpHandler, authHeaderName, authHeaderValue))
+
+	if healthPath != "" {
+		mux.HandleFunc(healthPath, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		})
+	}
+
+	addr := fmt.Sprintf("%s:%s", host, port)
+	log.Printf("Starting HTTP MCP server on %s (mcp=%s, health=%s)", addr, mcpPath, healthPath)
+	if authEnabled {
+		log.Printf("HTTP mode header auth enabled for %s using header %q; health endpoint remains public", mcpPath, authHeaderName)
+	} else {
+		log.Printf("HTTP mode header auth disabled; network MCP endpoint %s is running in compatibility mode and %s remains public", mcpPath, healthPath)
+	}
+	return http.ListenAndServe(addr, mux)
+}
+
 func main() {
 	toolsPathFlag := flag.String("tools", "", "Path to JSON file with Tasker tool definitions")
-	host := flag.String("host", "0.0.0.0", "Host address to listen on for SSE server (default: 0.0.0.0)")
-	port := flag.String("port", "8000", "Port to listen on for SSE server (default: 8000)")
-	mode := flag.String("mode", "stdio", "Transport mode: sse, or stdio (default: stdio)")
+	host := flag.String("host", "0.0.0.0", "Host address to listen on for network server (default: 0.0.0.0)")
+	port := flag.String("port", "8000", "Port to listen on for network server (default: 8000)")
+	mode := flag.String("mode", "stdio", "Transport mode: http, streamable-http, sse, or stdio (default: stdio)")
+	mcpPath := flag.String("mcp-path", "/mcp", "Path for HTTP MCP endpoint (default: /mcp)")
+	healthPath := flag.String("health-path", "/healthz", "Path for HTTP health endpoint (default: /healthz)")
+	authHeaderName := flag.String("auth-header-name", "", "Header name required for MCP/SSE authentication (example: X-Tasker-Token)")
+	authHeaderValue := flag.String("auth-header-value", "", "Expected header value for MCP/SSE authentication")
 	taskerHostFlag := flag.String("tasker-host", "0.0.0.0", "Tasker server host (default: 0.0.0.0)")
 	taskerPortFlag := flag.String("tasker-port", "1821", "Tasker server port (default: 1821)")
 	taskerApiKeyFlag := flag.String("tasker-api-key", "", "Tasker API Key")
@@ -191,22 +308,46 @@ func main() {
 	taskerHost = *taskerHostFlag
 	taskerPort = *taskerPortFlag
 	taskerApiKey = *taskerApiKeyFlag
-  toolsPath = *toolsPathFlag
+	toolsPath = *toolsPathFlag
+
+	authEnabled := isHeaderAuthEnabled(*authHeaderName, *authHeaderValue)
+	if !authEnabled && (strings.TrimSpace(*authHeaderName) != "" || *authHeaderValue != "") {
+		configuredFlag := "--auth-header-name"
+		if strings.TrimSpace(*authHeaderName) != "" {
+			configuredFlag = "--auth-header-value"
+		}
+		log.Printf("Warning: header auth requires both --auth-header-name and --auth-header-value; %s is missing, so header auth is disabled", configuredFlag)
+	}
 
 	if toolsPath == "" {
 		log.Fatal("Please provide the -tools flag with the path to the JSON file containing tool definitions")
 	}
 
-	// Instantiate the MCP server using the new mcp-go-sdk API.
+	// Instantiate the MCP server using the mcp-go API.
 	mcpServer := NewMCPServer()
 
 	switch *mode {
+	case "http", "streamable-http":
+		if err := startHTTPServer(mcpServer, *host, *port, *mcpPath, *healthPath, *authHeaderName, *authHeaderValue); err != nil {
+			log.Fatalf("HTTP server error: %v", err)
+		}
 	case "sse":
-    addr := fmt.Sprintf("%s:%s", *host, *port)
-		// Create an SSE server to wrap the MCP server.
+		log.Printf("SSE mode is kept for compatibility. Please migrate clients to --mode http (HTTP mode).")
+		addr := fmt.Sprintf("%s:%s", *host, *port)
 		sseServer := server.NewSSEServer(mcpServer)
+		mux := http.NewServeMux()
+		protectedSSEHandler := withHeaderAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sseServer.ServeHTTP(w, r)
+		}), *authHeaderName, *authHeaderValue)
+		mux.Handle("/sse", protectedSSEHandler)
+		mux.Handle("/message", protectedSSEHandler)
+		if authEnabled {
+			log.Printf("SSE compatibility mode header auth enabled for /sse and /message using header %q", *authHeaderName)
+		} else {
+			log.Printf("SSE compatibility mode header auth disabled; /sse and /message are running in compatibility mode")
+		}
 		log.Printf("Starting SSE server on %s...", addr)
-		if err := sseServer.Start(addr); err != nil {
+		if err := http.ListenAndServe(addr, mux); err != nil {
 			log.Fatalf("SSE server error: %v", err)
 		}
 	case "stdio":
