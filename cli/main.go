@@ -17,18 +17,10 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// Online tool discovery protocol:
-//
-// When the CLI starts (and on every SIGHUP / file-mtime reload), it first asks
-// the Tasker side for a live tool list by invoking the `mcp_list_tools` task
-// via POST /run_task. The task is expected to return its tool table as a
-// UTF-8 JSON array body shaped like toolDescriptions.json
-// ([{tasker_name, name, description, inputSchema}, ...]).
-//
-// On any failure — task missing, timeout, non-200, malformed body, or empty
-// array — the CLI logs a warning and falls back to the --tools JSON file. The
-// file path is therefore still REQUIRED as a bootstrap fallback even when
-// Tasker online discovery is configured.
+// Online tool discovery protocol: on startup (and on every SIGHUP / mtime
+// reload) the CLI asks the Tasker side for a live tool list by invoking the
+// `mcp_list_tools` task via POST /run_task, falling back to the --tools JSON
+// file on any failure. See docs/online-tool-discovery.md for the full contract.
 
 var version = "dev" // overridden by -ldflags "-X main.version=..."
 

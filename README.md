@@ -218,6 +218,12 @@ node xml-to-tools.js /path/to/your/exported/mcp_server.prj.xml > toolDescription
 
 Use this `toolDescriptions.json` file with your server.
 
+### Optional: skip the offline regeneration step
+
+If you add an `mcp_list_tools` task to your Tasker project that returns the current tool table as a JSON array, the CLI will fetch it automatically at startup (and on every SIGHUP / mtime reload) and fall back to the `--tools` file only on failure. After editing your tools, simply `kill -HUP <pid>` (Linux) or restart the CLI — no more XML export + `xml-to-tools.js` round-trip.
+
+See [`docs/online-tool-discovery.md`](docs/online-tool-discovery.md) for the full protocol, Tasker-side implementation guide, and troubleshooting tips.
+
 ---
 
 ## Client configuration examples
