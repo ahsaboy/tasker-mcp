@@ -1,0 +1,8 @@
+{
+  "_comment": "Cursor MCP server config. Place at ~/.cursor/mcp.json or project-local .cursor/mcp.json. Cursor 0.46+ supports streamable-http MCP servers natively. For stdio, use the command/args format from claude_desktop_config.json.",
+  "mcpServers": {
+    "tasker": {
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}

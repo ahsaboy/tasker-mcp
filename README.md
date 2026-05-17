@@ -107,6 +107,21 @@ The `tasker-mcp-server-cli` application accepts the following flags:
 - `/healthz` remains public.
 - `--mode stdio` is unaffected.
 
+#### Or run via Docker
+
+Pull the multi-arch image from GitHub Container Registry (supports `linux/amd64` and `linux/arm64`):
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v $(pwd)/toolDescriptions.json:/etc/tasker-mcp/toolDescriptions.json:ro \
+  ghcr.io/ahsaboy/tasker-mcp:latest \
+  --tools /etc/tasker-mcp/toolDescriptions.json \
+  --tasker-host host.docker.internal \
+  --tasker-api-key tk_...
+```
+
+A new image is published automatically when a `v*` tag is pushed.
+
 ### Step 3: Connect Your MCP-enabled App
 
 - Connect your MCP-enabled application by pointing it to the running server.
@@ -202,6 +217,24 @@ node xml-to-tools.js /path/to/your/exported/mcp_server.prj.xml > toolDescription
 ```
 
 Use this `toolDescriptions.json` file with your server.
+
+---
+
+## Client configuration examples
+
+Sample MCP client configs are in `examples/`:
+
+| Client | File | Transport |
+|---|---|---|
+| Claude Desktop (stdio) | `examples/claude_desktop_config.json` | stdio |
+| Claude Desktop (HTTP) | `examples/claude_desktop_streamable_http.json` | streamable-http |
+| Cursor | `examples/cursor_mcp.json` | streamable-http |
+| Windsurf | `examples/windsurf_mcp_config.json` | streamable-http |
+| VSCode Continue | `examples/vscode_continue.json` | streamable-http |
+
+For HTTP-based clients, point the URL at your running `tasker-mcp` server (default `http://127.0.0.1:8000/mcp`). For stdio, the binary is launched as a child process — adjust `command` / `args` for your install path.
+
+If you enabled `--auth Name:Value`, your HTTP client must support custom request headers; some clients currently do not, in which case leave `--auth` empty and expose the server only on a trusted network.
 
 ---
 

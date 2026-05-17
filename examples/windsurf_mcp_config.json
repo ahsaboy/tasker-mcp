@@ -1,0 +1,8 @@
+{
+  "_comment": "Codeium Windsurf MCP server config. Place at ~/.codeium/windsurf/mcp_config.json. Uses serverUrl field for streamable-http transport.",
+  "mcpServers": {
+    "tasker": {
+      "serverUrl": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}

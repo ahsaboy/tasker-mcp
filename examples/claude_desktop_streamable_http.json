@@ -1,0 +1,9 @@
+{
+  "_comment": "Claude Desktop streamable-http MCP server example. Requires Claude Desktop with HTTP transport support; otherwise use claude_desktop_config.json (stdio).",
+  "mcpServers": {
+    "tasker": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}

@@ -205,9 +205,16 @@ func TestE2E_InitializeAndToolsList(t *testing.T) {
 		{TaskerName: "Task A", Name: "tool_a", Description: "tool A", InputSchema: minimalSchema("msg")},
 		{TaskerName: "Task B", Name: "tool_b", Description: "tool B", InputSchema: minimalSchema("msg")},
 	}
-	// Tasker mock must not be invoked for initialize / tools/list.
+	// Tasker mock allows the startup mcp_list_tools probe (responding 500 so the
+	// CLI falls back to the file), but errors on any subsequent call since
+	// initialize / tools/list must not hit Tasker.
 	taskerHandler := func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("unexpected tasker call: %s %s", r.Method, r.URL.Path)
+		bb, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(bb), `"name":"mcp_list_tools"`) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		t.Errorf("unexpected tasker call: %s %s body=%q", r.Method, r.URL.Path, string(bb))
 		http.Error(w, "no", http.StatusInternalServerError)
 	}
 	mcpURL, _, _ := startTestServer(t, taskerHandler, tools, false)
@@ -537,5 +544,175 @@ func TestE2E_StructuredResultArray(t *testing.T) {
 	}
 	if text := extractText(t, resp.Result); text != "[1,2,3]" {
 		t.Errorf("fallback text=%q, want \"[1,2,3]\"", text)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 8: Tasker online discovery via mcp_list_tools — online wins over file.
+// The local --tools file is intentionally invalid JSON, proving that online
+// discovery is used as the primary source when available.
+// -----------------------------------------------------------------------------
+
+func TestE2E_TaskerOnlineDiscovery(t *testing.T) {
+	onlineTools := []TaskerTool{
+		{TaskerName: "X", Name: "online_tool", Description: "discovered online", InputSchema: minimalSchema("msg")},
+	}
+	onlineBody, err := json.Marshal(onlineTools)
+	if err != nil {
+		t.Fatalf("marshal online tools: %v", err)
+	}
+	taskerHandler := func(w http.ResponseWriter, r *http.Request) {
+		bb, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(bb), `"name":"mcp_list_tools"`) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(onlineBody)
+			return
+		}
+		t.Errorf("unexpected tasker call body=%q", string(bb))
+		http.Error(w, "no", http.StatusInternalServerError)
+	}
+
+	// Set up globals + tasker mock manually (so we can write BAD JSON to the file).
+	prevHost, prevPort, prevKey, prevTimeout, prevTools := taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur, toolsPath
+	taskerMock := httptest.NewServer(http.HandlerFunc(taskerHandler))
+	u, err := url.Parse(taskerMock.URL)
+	if err != nil {
+		taskerMock.Close()
+		t.Fatalf("parse tasker mock url: %v", err)
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+	}
+	taskerHost = u.Hostname()
+	taskerPort = port
+	taskerApiKey = "test-key"
+	taskerTimeoutDur = 5 * time.Second
+
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "toolDescriptions.json")
+	if err := os.WriteFile(badPath, []byte("not a valid json array"), 0o644); err != nil {
+		taskerMock.Close()
+		t.Fatalf("write bad tools file: %v", err)
+	}
+	toolsPath = badPath
+
+	mcpServer := NewMCPServer()
+	mux := buildHTTPMux(mcpServer, "", "")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		taskerMock.Close()
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	time.Sleep(50 * time.Millisecond)
+
+	mcpURL := "http://" + ln.Addr().String() + "/mcp"
+
+	t.Cleanup(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutCancel()
+		_ = srv.Shutdown(shutCtx)
+		taskerMock.Close()
+		taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur, toolsPath = prevHost, prevPort, prevKey, prevTimeout, prevTools
+	})
+
+	sid := initSession(t, mcpURL)
+
+	resp, _, raw := mcpCall(t, mcpURL,
+		map[string]string{"Mcp-Session-Id": sid},
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if resp == nil || resp.Result == nil {
+		t.Fatalf("tools/list: no result (raw=%q)", raw)
+	}
+	listed, _ := resp.Result["tools"].([]any)
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 online tool, got %d (raw=%q)", len(listed), raw)
+	}
+	names := map[string]bool{}
+	for _, item := range listed {
+		if m, ok := item.(map[string]any); ok {
+			if n, _ := m["name"].(string); n != "" {
+				names[n] = true
+			}
+		}
+	}
+	if !names["online_tool"] {
+		t.Errorf("expected online_tool in tools/list, got %v", names)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 9: Tasker online discovery fallback — when mcp_list_tools returns 404,
+// the CLI falls back to the local --tools JSON file.
+// -----------------------------------------------------------------------------
+
+func TestE2E_TaskerOnlineFallbackToFile(t *testing.T) {
+	fileTools := []TaskerTool{
+		{TaskerName: "Task Y", Name: "file_tool_y", Description: "from file", InputSchema: minimalSchema("msg")},
+	}
+	taskerHandler := func(w http.ResponseWriter, r *http.Request) {
+		bb, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(bb), `"name":"mcp_list_tools"`) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		t.Errorf("unexpected tasker call body=%q", string(bb))
+		http.Error(w, "no", http.StatusInternalServerError)
+	}
+
+	mcpURL, _, _ := startTestServer(t, taskerHandler, fileTools, false)
+	sid := initSession(t, mcpURL)
+
+	resp, _, raw := mcpCall(t, mcpURL,
+		map[string]string{"Mcp-Session-Id": sid},
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if resp == nil || resp.Result == nil {
+		t.Fatalf("tools/list: no result (raw=%q)", raw)
+	}
+	listed, _ := resp.Result["tools"].([]any)
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 file tool, got %d (raw=%q)", len(listed), raw)
+	}
+	names := map[string]bool{}
+	for _, item := range listed {
+		if m, ok := item.(map[string]any); ok {
+			if n, _ := m["name"].(string); n != "" {
+				names[n] = true
+			}
+		}
+	}
+	if !names["file_tool_y"] {
+		t.Errorf("expected file_tool_y in tools/list, got %v", names)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Test 10: Both online and file unavailable — tryLoadTools surfaces an error.
+// We point Tasker at a refusing address and the file path to a nonexistent
+// file, and assert tryLoadTools returns a non-nil error.
+// -----------------------------------------------------------------------------
+
+func TestE2E_TaskerOnlineBothFail(t *testing.T) {
+	prevHost, prevPort, prevKey, prevTimeout := taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur
+	// Point Tasker at a port that should refuse connections quickly.
+	taskerHost = "127.0.0.1"
+	taskerPort = "1"
+	taskerApiKey = "test-key"
+	taskerTimeoutDur = 500 * time.Millisecond
+	t.Cleanup(func() {
+		taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur = prevHost, prevPort, prevKey, prevTimeout
+	})
+
+	tools, source, err := tryLoadTools(filepath.Join(t.TempDir(), "nonexistent.json"))
+	if err == nil {
+		t.Fatalf("expected error when both online and file fail; got tools=%v source=%q", tools, source)
+	}
+	if source != "" {
+		t.Errorf("expected empty source on total failure, got %q", source)
+	}
+	if tools != nil {
+		t.Errorf("expected nil tools on total failure, got %v", tools)
 	}
 }
