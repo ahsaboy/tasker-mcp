@@ -89,7 +89,7 @@ echo $payload | ./mcp-server --tools /path/to/toolDescriptions.json --tasker-api
 
 The `tasker-mcp-server-cli` application accepts the following flags:
 
-- `--tools`: Path to JSON file with Tasker tool definitions. **(required)**
+- `--tools`: Path to JSON file with Tasker tool definitions. **Optional**: if omitted, the CLI requires Tasker online discovery via `mcp_list_tools` (see below) and exits if unavailable. If both `--tools` and online discovery are configured, online takes precedence and `--tools` is used as a fallback.
 - `--host`: Host address to listen on (default: `0.0.0.0`).
 - `--port`: Port to listen on (default: `8000`).
 - `--mode`: Transport mode: `streamable-http` or `stdio` (default: `streamable-http`).

@@ -716,3 +716,64 @@ func TestE2E_TaskerOnlineBothFail(t *testing.T) {
 		t.Errorf("expected nil tools on total failure, got %v", tools)
 	}
 }
+
+// TestE2E_NoToolsFlagOnlineOnly — when --tools is empty and Tasker online
+// discovery succeeds, tryLoadTools returns the online list with no warning
+// path. This is the "no fallback configured" happy case.
+func TestE2E_NoToolsFlagOnlineOnly(t *testing.T) {
+	taskerMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"name":"mcp_list_tools"`) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"tasker_name":"X","name":"online_only_tool","description":"d","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}},"required":["msg"]}}]`))
+			return
+		}
+		http.Error(w, "unexpected", http.StatusBadRequest)
+	}))
+	t.Cleanup(taskerMock.Close)
+
+	host, port, _ := strings.Cut(strings.TrimPrefix(taskerMock.URL, "http://"), ":")
+	prevHost, prevPort, prevKey, prevTimeout := taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur
+	taskerHost = host
+	taskerPort = port
+	taskerApiKey = "test-key"
+	taskerTimeoutDur = 5 * time.Second
+	t.Cleanup(func() {
+		taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur = prevHost, prevPort, prevKey, prevTimeout
+	})
+
+	tools, source, err := tryLoadTools("")
+	if err != nil {
+		t.Fatalf("tryLoadTools with empty path + online available: %v", err)
+	}
+	if source != "tasker" {
+		t.Errorf("source = %q, want tasker", source)
+	}
+	if len(tools) != 1 || tools[0].Name != "online_only_tool" {
+		t.Errorf("unexpected tools: %+v", tools)
+	}
+}
+
+// TestE2E_NoToolsFlagOnlineFails — when --tools is empty and Tasker is
+// unreachable, tryLoadTools returns an error (no silent file fallback).
+func TestE2E_NoToolsFlagOnlineFails(t *testing.T) {
+	prevHost, prevPort, prevKey, prevTimeout := taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur
+	taskerHost = "127.0.0.1"
+	taskerPort = "1" // refused
+	taskerApiKey = ""
+	taskerTimeoutDur = 500 * time.Millisecond
+	t.Cleanup(func() {
+		taskerHost, taskerPort, taskerApiKey, taskerTimeoutDur = prevHost, prevPort, prevKey, prevTimeout
+	})
+
+	tools, source, err := tryLoadTools("")
+	if err == nil {
+		t.Fatalf("expected error when --tools empty and online down; got tools=%v source=%q", tools, source)
+	}
+	if !strings.Contains(err.Error(), "--tools not set") {
+		t.Errorf("expected error mentioning --tools not set, got: %v", err)
+	}
+	if tools != nil || source != "" {
+		t.Errorf("expected zero values on failure, got tools=%v source=%q", tools, source)
+	}
+}

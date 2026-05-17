@@ -130,10 +130,16 @@ INFO  msg="tools source" source=file count=27
 
 ### 与 `--tools` 文件的关系
 
-- `--tools <path>` **仍然是 required**。即使 online discovery 工作，也必须给一个**存在且合法**的兜底文件——首次启动若 online 也不可用，需要它来引导。
-- online 成功时，`--tools` 文件的内容被**忽略**（不读取）。
-- online 失败时，`--tools` 文件被读取，按现有 `toolDescriptions.json` 路径走。
-- 推荐做法：始终保留 `--tools` 指向**最近一次导出**的 `toolDescriptions.json`，作为安全网。
+`--tools` 是**可选**的。行为根据是否设置它而变：
+
+| `--tools` 给了？ | online 成功？ | 行为 |
+|---|---|---|
+| 是 | 是 | 用 online，`--tools` 文件内容被忽略 |
+| 是 | 否 | `WARN` + 读 `--tools` 文件；file 也失败才退出 |
+| 否 | 是 | 用 online，**无警告**（静默） |
+| 否 | 否 | `ERROR` + 立即退出（没有 fallback 可用） |
+
+推荐做法之一：始终保留 `--tools` 指向**最近一次导出**的 `toolDescriptions.json`，作为安全网。如果你的 Tasker 端 `mcp_list_tools` 已经稳定，也可以**完全不传 `--tools`**——CLI 会强依赖 online 路径，发现 Tasker 端配置出错时立即 fail-fast 退出。
 
 ---
 

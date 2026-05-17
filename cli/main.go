@@ -188,17 +188,25 @@ func loadToolsFromTasker(host, port, apiKey string, timeout time.Duration) ([]Ta
 // On any failure it falls back to the local toolDescriptions.json. The second
 // return value describes which source was used ("tasker" or "file") so it can
 // be logged.
+// tryLoadTools fetches the live tool list. If localPath is empty, only the
+// online path (Tasker mcp_list_tools) is attempted and any failure becomes a
+// fatal error for the caller. If localPath is non-empty, online failure is
+// logged as a warning and the on-disk file is used as a fallback.
 func tryLoadTools(localPath string) ([]TaskerTool, string, error) {
-	if tools, err := loadToolsFromTasker(taskerHost, taskerPort, taskerApiKey, 5*time.Second); err == nil {
+	tools, onlineErr := loadToolsFromTasker(taskerHost, taskerPort, taskerApiKey, 5*time.Second)
+	if onlineErr == nil {
 		return tools, "tasker", nil
-	} else {
-		slog.Warn("tasker online discovery unavailable, falling back to file", "err", err)
 	}
-	tools, err := loadToolsFromFile(localPath)
-	if err != nil {
-		return nil, "", err
+	if localPath == "" {
+		// No fallback configured. Surface the online error directly.
+		return nil, "", fmt.Errorf("tasker online discovery unavailable and --tools not set: %w", onlineErr)
 	}
-	return tools, "file", nil
+	slog.Warn("tasker online discovery unavailable, falling back to file", "err", onlineErr)
+	fileTools, fileErr := loadToolsFromFile(localPath)
+	if fileErr != nil {
+		return nil, "", fileErr
+	}
+	return fileTools, "file", nil
 }
 
 // buildServerTools translates loaded TaskerTool entries into mcp-go ServerTool
@@ -277,6 +285,12 @@ func reloadTools(s *server.MCPServer, path string) (int, error) {
 // whenever its modification time changes. Errors are logged; the previous
 // tool table remains active until a successful reload.
 func watchToolsFile(ctx context.Context, s *server.MCPServer, path string) {
+	if path == "" {
+		// Nothing to watch — no fallback file was configured. Reloads still
+		// reachable via SIGHUP on Unix.
+		<-ctx.Done()
+		return
+	}
 	var lastMod time.Time
 	if st, err := os.Stat(path); err == nil {
 		lastMod = st.ModTime()
@@ -421,7 +435,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	showVersion := flag.Bool("version", false, "Print version information and exit")
-	toolsPathFlag := flag.String("tools", "", "Path to JSON file with Tasker tool definitions (required)")
+	toolsPathFlag := flag.String("tools", "", "Path to JSON file with Tasker tool definitions (optional fallback; if empty, requires Tasker online discovery)")
 	host := flag.String("host", "0.0.0.0", "Host address to listen on for network server")
 	port := flag.String("port", "8000", "Port to listen on for network server")
 	mode := flag.String("mode", "streamable-http", "Transport mode: streamable-http or stdio")
@@ -456,10 +470,9 @@ func main() {
 		}
 	}
 
-	if toolsPath == "" {
-		slog.Error("missing required flag", "flag", "-tools")
-		os.Exit(1)
-	}
+	// --tools is optional: when omitted, the CLI relies solely on Tasker
+	// online discovery (mcp_list_tools); failure to reach Tasker becomes
+	// fatal because there is no file fallback configured.
 
 	// Instantiate the MCP server using the mcp-go API.
 	mcpServer := NewMCPServer()
