@@ -15,7 +15,7 @@ This document will guide you through setting up and running the Tasker MCP integ
 
 **CLI Server:**
 
-- From the `dist/` folder, select the correct CLI server binary for your device's architecture, such as `tasker-mcp-server-cli-aarch64`.
+- Download the binary for your device's architecture from the latest [GitHub Release](https://github.com/ahsaboy/tasker-mcp/releases), or build it yourself (see "Building the CLI Server Yourself" below).
 - Copy both the binary and the `toolDescriptions.json` file to your device (phone or PC).
 - Rename the binary to `mcp-server` after copying.
 
@@ -24,96 +24,92 @@ This document will guide you through setting up and running the Tasker MCP integ
 Using `scp`:
 
 ```bash
-scp dist/tasker-mcp-server-cli-aarch64 user@phone_ip:/data/data/com.termux/files/home/mcp-server
+scp ./tasker-mcp-server-cli-aarch64 user@phone_ip:/data/data/com.termux/files/home/mcp-server
 ```
 
 Using `adb push`:
 
 ```bash
-adb push dist/tasker-mcp-server-cli-aarch64 /data/data/com.termux/files/home/mcp-server
+adb push ./tasker-mcp-server-cli-aarch64 /data/data/com.termux/files/home/mcp-server
 ```
 
 - Run the server in recommended **HTTP mode** with:
 
 ```bash
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --mcp-path /mcp --health-path /healthz
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_...
 ```
 
-- Header auth is optional and disabled by default. It only turns on when both `--auth-header-name` and `--auth-header-value` are provided, so existing network deployments are unchanged unless you opt in.
+- Header auth is optional and disabled by default. It only turns on when `--auth` parses to a non-empty `Name:Value`, so existing network deployments are unchanged unless you opt in.
 
 - Run HTTP mode with header auth enabled:
 
 ```bash
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --mcp-path /mcp --health-path /healthz --auth-header-name X-Tasker-Token --auth-header-value your-secret
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --auth X-Tasker-Token:your-secret
 ```
 
-- HTTP mode request examples:
+- HTTP mode request examples (the `/mcp` endpoint requires `Accept: application/json, text/event-stream`):
 
 ```bash
 # Missing header -> 401
-curl -i -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+curl -i -X POST http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
 # Correct header -> MCP response
-curl -i -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' -H 'X-Tasker-Token: your-secret' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+curl -i -X POST http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Tasker-Token: your-secret' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
 # Health endpoint stays public
 curl -i http://127.0.0.1:8000/healthz
 ```
 
-- `stdio` transport is unaffected by header auth:
+- `stdio` transport is unaffected by header auth (you must pass `--mode stdio` now since the default is `streamable-http`):
 
 ```bash
 payload='{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "tasker_flash_text", "arguments": { "text": "Hi" }  } }'
-echo $payload | ./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_...
+echo $payload | ./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode stdio
 ```
 
-- SSE is still available as a compatibility mode during migration, but HTTP mode is the recommended transport:
+- Streamable HTTP is the recommended remote transport (MCP specification 2025-11-25):
 
 ```bash
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode sse
+./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_...
 ```
+
+- Streamable HTTP supports bidirectional communication on the fixed `/mcp` endpoint:
+  - Clients use POST to send requests and receive immediate responses
+  - Clients use GET to establish long-lived connections for receiving server-pushed notifications
+  - Uses `Mcp-Session-Id` header for session management
 
 #### Command-Line Flags
 
 The `tasker-mcp-server-cli` application accepts the following flags:
 
-- `--tools`: Path to JSON file with Tasker tool definitions.
-- `--host`: Host address to listen on for network server (default: `0.0.0.0`).
-- `--port`: Port to listen on for network server (default: `8000`).
-- `--mode`: Transport mode: `http`, `streamable-http`, `sse`, or `stdio` (default: `stdio`).
-- `--mcp-path`: HTTP MCP endpoint path in HTTP mode (default: `/mcp`).
-- `--health-path`: HTTP health endpoint path in HTTP mode (default: `/healthz`).
-- `--tasker-host`: Tasker server host (default: `0.0.0.0`).
+- `--tools`: Path to JSON file with Tasker tool definitions. **(required)**
+- `--host`: Host address to listen on (default: `0.0.0.0`).
+- `--port`: Port to listen on (default: `8000`).
+- `--mode`: Transport mode: `streamable-http` or `stdio` (default: `streamable-http`).
+- `--tasker-host`: Tasker server host (default: `127.0.0.1`).
 - `--tasker-port`: Tasker server port (default: `1821`).
 - `--tasker-api-key`: The Tasker API Key.
-- `--auth-header-name`: Header name required to access network MCP endpoints. Example: `X-Tasker-Token`.
-- `--auth-header-value`: Expected value for `--auth-header-name`.
+- `--tasker-timeout`: HTTP timeout when calling Tasker (default: `30s`).
+- `--auth`: Optional header auth, format `"Name:Value"` (e.g. `"X-Tasker-Token:secret"`). Empty disables auth.
+- `--version`: Print version information and exit.
 
 **Header auth behavior:**
-- Header auth is disabled by default.
-- Header auth is enabled only when both `--auth-header-name` and `--auth-header-value` are non-empty.
-- If only one auth flag is set, auth stays disabled and the server logs a warning.
-- Protection scope is only network MCP endpoints (`--mcp-path` in HTTP mode, `/sse` and `/message` in SSE compatibility mode).
-- Health endpoint (`--health-path`) remains public.
+- Header auth is disabled by default; it is enabled only when `--auth` parses to a non-empty `Name:Value`.
+- Malformed `--auth` (missing colon or empty value) logs a warning and keeps auth disabled.
+- Protection scope is the `/mcp` endpoint only.
+- `/healthz` remains public.
 - `--mode stdio` is unaffected.
 
 ### Step 3: Connect Your MCP-enabled App
 
 - Connect your MCP-enabled application by pointing it to the running server.
-
-#### HTTP migration note (SSE -> HTTP)
-
-If you currently run SSE (`--mode sse`), migrate to HTTP by switching startup flags:
-
-```bash
-# Before (compatibility mode)
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode sse --host 0.0.0.0 --port 8000
-
-# After (recommended)
-./mcp-server --tools /path/to/toolDescriptions.json --tasker-api-key=tk_... --mode http --host 0.0.0.0 --port 8000 --mcp-path /mcp --health-path /healthz
-```
-
-Then connect MCP clients to the HTTP endpoint path (`/mcp` by default).
 
 #### Example Configuration for Claude Desktop with stdio transport
 

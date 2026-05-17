@@ -3,3 +3,22 @@
 repomix-output.*
 
 docs/llms/
+
+# Pre-compiled CLI binaries (use GitHub Releases instead)
+/dist/tasker-mcp
+/dist/tasker-mcp.exe
+/dist/tasker-mcp-server-cli-aarch64
+/dist/tasker-mcp-server-cli-x86_64
+/dist/tasker-mcp-server-cli-armv7
+/dist/plugin.wasm
+
+# Local Go test/build artefacts
+/cli/cli
+/cli/cli.exe
+/cli/tm
+/cli/tm.exe
+
+# Private / user-specific files
+/CLAUDE.md
+/docs/upgrade-plan.md
+/utils/toolDescriptions.json

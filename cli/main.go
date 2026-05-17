@@ -7,20 +7,29 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/dceluis/mcp-go/mcp"
-	"github.com/dceluis/mcp-go/server"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
+
+var version = "dev" // overridden by -ldflags "-X main.version=..."
 
 // Global variables for Tasker server host and port.
 var toolsPath string
 var taskerHost string
 var taskerPort string
 var taskerApiKey string
+var taskerTimeoutDur time.Duration
+
+// structuredCtxKey is a typed context key set by the HTTP middleware when the
+// caller opts into Structured Tool Results via the X-Tasker-Structured header.
+// stdio transport never sets this, so structured output is HTTP-only.
+type structuredCtxKey struct{}
 
 // GenericMap is a new type for tool arguments.
 type GenericMap map[string]interface{}
@@ -40,12 +49,34 @@ func genericToolHandler(tool TaskerTool) server.ToolHandlerFunc {
 		if args == nil {
 			return mcp.NewToolResultError("Arguments must be provided"), nil
 		}
+		argsMap, ok := args.(map[string]interface{})
+		if !ok {
+			return mcp.NewToolResultError("Arguments must be an object"), nil
+		}
 		// Log the tool call.
-		log.Printf("Tool called: %s with args: %+v", tool.Name, args)
+		// TODO: pull session id from ctx when mcp-go v0.49 exposes a stable accessor.
+		slog.Info("tool called", "name", tool.Name, "args", argsMap)
 		// Execute the Tasker task.
-		result, err := runTaskerTask(tool.TaskerName, args)
+		result, err := runTaskerTask(tool.TaskerName, argsMap)
 		if err != nil {
-			return nil, err
+			return mcp.NewToolResultErrorf("tasker call failed: %v", err), nil
+		}
+		// Opt-in Structured Tool Result: caller sets X-Tasker-Structured: true|1
+		// on the HTTP request, the middleware writes a flag into ctx, and we
+		// attempt to parse the Tasker response body as JSON. On success we
+		// return structured content (with the raw text as fallback). On any
+		// failure (flag unset, stdio, body not JSON-shaped, parse error) we
+		// fall through to plain text — fully backward compatible.
+		if flag, _ := ctx.Value(structuredCtxKey{}).(bool); flag {
+			trimmed := strings.TrimSpace(result)
+			if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+				var parsed any
+				if jsonErr := json.Unmarshal([]byte(trimmed), &parsed); jsonErr == nil {
+					slog.Info("returning structured result", "name", tool.Name)
+					return mcp.NewToolResultStructured(parsed, result), nil
+				}
+				slog.Debug("structured opted in but body not valid JSON", "name", tool.Name)
+			}
 		}
 		// Return the result using the new result constructor.
 		return mcp.NewToolResultText(result), nil
@@ -73,7 +104,7 @@ func runTaskerTask(taskerName string, args map[string]interface{}) (string, erro
 	if taskerApiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+taskerApiKey)
 	}
-	client := &http.Client{}
+	client := &http.Client{Timeout: taskerTimeoutDur}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -82,6 +113,7 @@ func runTaskerTask(taskerName string, args map[string]interface{}) (string, erro
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		slog.Warn("tasker call failed", "url", taskerURL, "status", resp.StatusCode)
 		return "", fmt.Errorf("HTTP error: %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
 
@@ -105,19 +137,11 @@ func loadToolsFromFile(filePath string) ([]TaskerTool, error) {
 	return tools, nil
 }
 
-func NewMCPServer() *server.MCPServer {
-	mcpServer := server.NewMCPServer(
-		"tasker-mcp-server",
-		"1.0.0",
-		server.WithLogging(),
-	)
-
-	taskerTools, err := loadToolsFromFile(toolsPath)
-	if err != nil {
-		log.Fatalf("Failed to load tools from file: %v", err)
-	}
-
-	for _, tool := range taskerTools {
+// buildServerTools translates loaded TaskerTool entries into mcp-go ServerTool
+// values (each containing an mcp.Tool description and its handler).
+func buildServerTools(tools []TaskerTool) []server.ServerTool {
+	result := make([]server.ServerTool, 0, len(tools))
+	for _, tool := range tools {
 		inputSchema := tool.InputSchema
 
 		var opts []mcp.ToolOption
@@ -166,9 +190,72 @@ func NewMCPServer() *server.MCPServer {
 		allOpts := append([]mcp.ToolOption{mcp.WithDescription(tool.Description)}, opts...)
 		toolObj := mcp.NewTool(tool.Name, allOpts...)
 		handler := genericToolHandler(tool)
-		mcpServer.AddTool(toolObj, handler)
+		result = append(result, server.ServerTool{Tool: toolObj, Handler: handler})
 	}
+	return result
+}
 
+// reloadTools reads the tools file from disk, builds the mcp ServerTool slice,
+// and atomically swaps it into the running MCPServer. On failure the existing
+// tool table is left untouched.
+func reloadTools(s *server.MCPServer, path string) (int, error) {
+	tools, err := loadToolsFromFile(path)
+	if err != nil {
+		return 0, err
+	}
+	serverTools := buildServerTools(tools)
+	s.SetTools(serverTools...)
+	return len(serverTools), nil
+}
+
+// watchToolsFile polls the tools JSON file on disk and triggers a reload
+// whenever its modification time changes. Errors are logged; the previous
+// tool table remains active until a successful reload.
+func watchToolsFile(ctx context.Context, s *server.MCPServer, path string) {
+	var lastMod time.Time
+	if st, err := os.Stat(path); err == nil {
+		lastMod = st.ModTime()
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			st, err := os.Stat(path)
+			if err != nil {
+				slog.Warn("tools file stat failed", "err", err)
+				continue
+			}
+			if st.ModTime().Equal(lastMod) {
+				continue
+			}
+			lastMod = st.ModTime()
+			n, err := reloadTools(s, path)
+			if err != nil {
+				slog.Error("reload failed", "err", err)
+				continue
+			}
+			slog.Info("tools reloaded", "count", n, "trigger", "mtime")
+		}
+	}
+}
+
+func NewMCPServer() *server.MCPServer {
+	mcpServer := server.NewMCPServer(
+		"tasker-mcp-server",
+		version,
+		server.WithLogging(),
+		server.WithToolCapabilities(true),
+	)
+
+	n, err := reloadTools(mcpServer, toolsPath)
+	if err != nil {
+		slog.Error("failed to load tools", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("tools loaded", "count", n, "path", toolsPath)
 	return mcpServer
 }
 
@@ -200,6 +287,20 @@ func withHeaderAuth(next http.Handler, name, value string) http.Handler {
 	})
 }
 
+// withStructuredFlag inspects the X-Tasker-Structured request header and, when
+// the caller opts in (value "true" or "1", case-insensitive), writes a typed
+// flag into the request context so that genericToolHandler can produce a
+// Structured Tool Result instead of plain text. Always wraps; opt-in is purely
+// a per-request header decision.
+func withStructuredFlag(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Tasker-Structured"))); v == "true" || v == "1" {
+			r = r.WithContext(context.WithValue(r.Context(), structuredCtxKey{}, true))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
@@ -214,147 +315,117 @@ func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, message 
 	})
 }
 
-func startHTTPServer(mcpServer *server.MCPServer, host, port, mcpPath, healthPath, authHeaderName, authHeaderValue string) error {
-	mcpPath = normalizePath(mcpPath)
-	healthPath = normalizePath(healthPath)
-	if mcpPath == "" {
-		return fmt.Errorf("mcp path cannot be empty")
-	}
-
-	authEnabled := isHeaderAuthEnabled(authHeaderName, authHeaderValue)
+// buildHTTPMux constructs the MCP + healthz mux with the standard middleware
+// chain. Exposed so tests can run the server on an arbitrary listener.
+func buildHTTPMux(mcpServer *server.MCPServer, authHeaderName, authHeaderValue string) *http.ServeMux {
+	streamable := server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath("/mcp"))
 	mux := http.NewServeMux()
-
-	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions {
-			w.Header().Set("Allow", "POST, OPTIONS")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, "Method not allowed")
-			return
-		}
-
-		sessionID := r.Header.Get("Mcp-Session-Id")
-		if sessionID == "" {
-			sessionID = r.URL.Query().Get("sessionId")
-		}
-		if sessionID == "" {
-			sessionID = "http"
-		}
-
-		ctx := mcpServer.WithContext(r.Context(), server.NotificationContext{
-			ClientID:  sessionID,
-			SessionID: sessionID,
-		})
-
-		var rawMessage json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&rawMessage); err != nil {
-			writeJSONRPCError(w, nil, mcp.PARSE_ERROR, "Parse error")
-			return
-		}
-
-		response := mcpServer.HandleMessage(ctx, rawMessage)
-		if response == nil {
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			log.Printf("Failed to encode MCP response: %v", err)
-		}
-	})
-
-	mux.Handle(mcpPath, withHeaderAuth(mcpHandler, authHeaderName, authHeaderValue))
-
-	if healthPath != "" {
-		mux.HandleFunc(healthPath, func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet {
-				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		})
+	var handler http.Handler = streamable
+	if isHeaderAuthEnabled(authHeaderName, authHeaderValue) {
+		handler = withHeaderAuth(handler, authHeaderName, authHeaderValue)
 	}
+	// Wrap with structured-flag middleware as the outermost layer so the ctx
+	// key is set regardless of whether auth is enabled. (Unauthorized requests
+	// never reach the tool handler anyway, so leaking the flag is harmless.)
+	handler = withStructuredFlag(handler)
+	mux.Handle("/mcp", handler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	return mux
+}
 
+func startHTTPServer(mcpServer *server.MCPServer, host, port, authHeaderName, authHeaderValue string, taskerTimeout time.Duration) error {
+	// taskerTimeout is consumed via the package-level taskerTimeoutDur set in main();
+	// this signature is kept for compatibility with the call sites.
+	_ = taskerTimeout
+	mux := buildHTTPMux(mcpServer, authHeaderName, authHeaderValue)
 	addr := fmt.Sprintf("%s:%s", host, port)
-	log.Printf("Starting HTTP MCP server on %s (mcp=%s, health=%s)", addr, mcpPath, healthPath)
-	if authEnabled {
-		log.Printf("HTTP mode header auth enabled for %s using header %q; health endpoint remains public", mcpPath, authHeaderName)
-	} else {
-		log.Printf("HTTP mode header auth disabled; network MCP endpoint %s is running in compatibility mode and %s remains public", mcpPath, healthPath)
+	slog.Info("starting streamable-http server", "addr", addr, "endpoint", "/mcp", "health", "/healthz")
+	if isHeaderAuthEnabled(authHeaderName, authHeaderValue) {
+		slog.Info("header auth enabled on /mcp", "header", authHeaderName)
 	}
 	return http.ListenAndServe(addr, mux)
 }
 
 func main() {
-	toolsPathFlag := flag.String("tools", "", "Path to JSON file with Tasker tool definitions")
-	host := flag.String("host", "0.0.0.0", "Host address to listen on for network server (default: 0.0.0.0)")
-	port := flag.String("port", "8000", "Port to listen on for network server (default: 8000)")
-	mode := flag.String("mode", "stdio", "Transport mode: http, streamable-http, sse, or stdio (default: stdio)")
-	mcpPath := flag.String("mcp-path", "/mcp", "Path for HTTP MCP endpoint (default: /mcp)")
-	healthPath := flag.String("health-path", "/healthz", "Path for HTTP health endpoint (default: /healthz)")
-	authHeaderName := flag.String("auth-header-name", "", "Header name required for MCP/SSE authentication (example: X-Tasker-Token)")
-	authHeaderValue := flag.String("auth-header-value", "", "Expected header value for MCP/SSE authentication")
-	taskerHostFlag := flag.String("tasker-host", "0.0.0.0", "Tasker server host (default: 0.0.0.0)")
-	taskerPortFlag := flag.String("tasker-port", "1821", "Tasker server port (default: 1821)")
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	showVersion := flag.Bool("version", false, "Print version information and exit")
+	toolsPathFlag := flag.String("tools", "", "Path to JSON file with Tasker tool definitions (required)")
+	host := flag.String("host", "0.0.0.0", "Host address to listen on for network server")
+	port := flag.String("port", "8000", "Port to listen on for network server")
+	mode := flag.String("mode", "streamable-http", "Transport mode: streamable-http or stdio")
+	taskerHostFlag := flag.String("tasker-host", "127.0.0.1", "Tasker server host")
+	taskerPortFlag := flag.String("tasker-port", "1821", "Tasker server port")
 	taskerApiKeyFlag := flag.String("tasker-api-key", "", "Tasker API Key")
+	taskerTimeout := flag.Duration("tasker-timeout", 30*time.Second, "HTTP timeout when calling Tasker")
+	authFlag := flag.String("auth", "", `Optional header auth in "Name:Value" form (empty disables)`)
 	flag.Parse()
+
+	// Print version and exit if requested
+	if *showVersion {
+		fmt.Printf("tasker-mcp version %s\n", version)
+		fmt.Println("Repository: https://github.com/ahsaboy/tasker-mcp")
+		return
+	}
 
 	// Set the global Tasker server variables.
 	taskerHost = *taskerHostFlag
 	taskerPort = *taskerPortFlag
 	taskerApiKey = *taskerApiKeyFlag
 	toolsPath = *toolsPathFlag
+	taskerTimeoutDur = *taskerTimeout
 
-	authEnabled := isHeaderAuthEnabled(*authHeaderName, *authHeaderValue)
-	if !authEnabled && (strings.TrimSpace(*authHeaderName) != "" || *authHeaderValue != "") {
-		configuredFlag := "--auth-header-name"
-		if strings.TrimSpace(*authHeaderName) != "" {
-			configuredFlag = "--auth-header-value"
+	var authName, authValue string
+	if s := strings.TrimSpace(*authFlag); s != "" {
+		if i := strings.Index(s, ":"); i > 0 && i < len(s)-1 {
+			authName = strings.TrimSpace(s[:i])
+			authValue = strings.TrimSpace(s[i+1:])
+		} else {
+			slog.Warn("--auth malformed, disabled", "value", *authFlag)
 		}
-		log.Printf("Warning: header auth requires both --auth-header-name and --auth-header-value; %s is missing, so header auth is disabled", configuredFlag)
 	}
 
 	if toolsPath == "" {
-		log.Fatal("Please provide the -tools flag with the path to the JSON file containing tool definitions")
+		slog.Error("missing required flag", "flag", "-tools")
+		os.Exit(1)
 	}
 
 	// Instantiate the MCP server using the mcp-go API.
 	mcpServer := NewMCPServer()
 
+	// Spin up watchers for hot-reload of the tools file. Both stdio and
+	// streamable-http modes benefit from this.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchToolsFile(ctx, mcpServer, toolsPath)
+	go watchReloadSignal(ctx, mcpServer, toolsPath)
+
 	switch *mode {
-	case "http", "streamable-http":
-		if err := startHTTPServer(mcpServer, *host, *port, *mcpPath, *healthPath, *authHeaderName, *authHeaderValue); err != nil {
-			log.Fatalf("HTTP server error: %v", err)
+	case "streamable-http":
+		if err := startHTTPServer(mcpServer, *host, *port, authName, authValue, *taskerTimeout); err != nil {
+			slog.Error("streamable http server error", "err", err)
+			os.Exit(1)
 		}
-	case "sse":
-		log.Printf("SSE mode is kept for compatibility. Please migrate clients to --mode http (HTTP mode).")
-		addr := fmt.Sprintf("%s:%s", *host, *port)
-		sseServer := server.NewSSEServer(mcpServer)
-		mux := http.NewServeMux()
-		protectedSSEHandler := withHeaderAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			sseServer.ServeHTTP(w, r)
-		}), *authHeaderName, *authHeaderValue)
-		mux.Handle("/sse", protectedSSEHandler)
-		mux.Handle("/message", protectedSSEHandler)
-		if authEnabled {
-			log.Printf("SSE compatibility mode header auth enabled for /sse and /message using header %q", *authHeaderName)
-		} else {
-			log.Printf("SSE compatibility mode header auth disabled; /sse and /message are running in compatibility mode")
-		}
-		log.Printf("Starting SSE server on %s...", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
-			log.Fatalf("SSE server error: %v", err)
+	case "http":
+		slog.Warn("--mode http is deprecated, use streamable-http")
+		if err := startHTTPServer(mcpServer, *host, *port, authName, authValue, *taskerTimeout); err != nil {
+			slog.Error("streamable http server error", "err", err)
+			os.Exit(1)
 		}
 	case "stdio":
 		if err := server.ServeStdio(mcpServer); err != nil {
-			log.Fatalf("Server error: %v", err)
+			slog.Error("server error", "err", err)
+			os.Exit(1)
 		}
 	default:
-		log.Fatalf("Unknown transport mode: %s", *mode)
+		slog.Error("unknown transport mode", "mode", *mode, "supported", "streamable-http, stdio")
+		os.Exit(1)
 	}
 }
